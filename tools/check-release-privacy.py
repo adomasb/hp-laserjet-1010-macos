@@ -27,7 +27,7 @@ def public_files():
     for name in paths:
         path = Path(name)
         if (path.is_absolute() or ".." in path.parts or not path.parts or
-                (any(p.startswith('.') for p in path.parts) and name not in {'.gitignore', '.github/workflows/software.yml'})):
+                (any(p.startswith('.') for p in path.parts) and name != '.gitignore')):
             raise ValueError("Invalid public manifest entry")
         full = ROOT / path
         if any(p.is_symlink() for p in [full, *full.parents]) or not full.is_file():

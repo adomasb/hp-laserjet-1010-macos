@@ -1,4 +1,3 @@
-.github/workflows/software.yml
 .gitignore
 LICENSE
 README.md

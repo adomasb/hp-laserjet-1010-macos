@@ -6,7 +6,7 @@ Run the complete software validation on Apple Silicon macOS from the repository 
 scripts/test-all.sh
 ```
 
-This builds the helper, runs every software suite, then builds and validates a local app ZIP. It does not install the app, change CUPS queues, publish a release, or open physical USB interfaces. The same command runs in `.github/workflows/software.yml` on a macOS 26 ARM64 runner. It requires local loopback sockets and macOS icon/signature utilities; a restricted sandbox may need those permissions.
+This builds the helper, runs every software suite, then builds and validates a local app ZIP. It does not install the app, change CUPS queues, publish a release, or open physical USB interfaces. It requires local loopback sockets and macOS icon/signature utilities; a restricted sandbox may need those permissions.
 
 Individual checks remain available for development:
 
