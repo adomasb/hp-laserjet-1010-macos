@@ -1,0 +1,61 @@
+--- a/pappl/client-webif.c
++++ b/pappl/client-webif.c
+@@ -225,6 +225,11 @@
+     // Flush remaining data...
+     if (httpGetState(client->http) == initial_state)
+       httpFlush(client->http);
++    if (body_size == body_alloc)
++    {
++      papplLogClient(client, PAPPL_LOGLEVEL_ERROR, "Discarding over-large form data.");
++      goto done;
++    }
+   }
+ 
+   // Parse the data in memory...
+@@ -305,7 +310,7 @@
+       num_form = cupsAddOption(name, value, num_form, form);
+     }
+   }
+-  else if (!strncmp(content_type, "multipart/form-data; ", 21) && (boundary = strstr(content_type, "boundary=")) != NULL)
++  else if (!strncmp(content_type, "multipart/form-data; ", 21) && (boundary = strstr(content_type, "boundary=")) != NULL && boundary[9])
+   {
+     // Read multi-part form data...
+     char	name[1024],		// Form variable name
+@@ -319,6 +324,11 @@
+     // Format the boundary string we are looking for...
+     snprintf(bstring, sizeof(bstring), "\r\n--%s", boundary + 9);
+     blen = strlen(bstring);
++    if (blen >= body_size)
++    {
++      papplLogClient(client, PAPPL_LOGLEVEL_ERROR, "Invalid multipart form data.");
++      goto done;
++    }
+ 
+     // Parse lines in the message body...
+     name[0] = '\0';
+@@ -345,14 +355,14 @@
+       if (!*line)
+       {
+         // End of headers, grab value...
+-        if (!name[0])
++        if (!name[0] || (bend = bodyend - blen) < bodyptr)
+         {
+           // No name value...
+ 	  papplLogClient(client, PAPPL_LOGLEVEL_ERROR, "Invalid multipart form data.");
+ 	  break;
+ 	}
+ 
+-	for (bend = bodyend - blen, ptr = memchr(bodyptr, '\r', (size_t)(bend - bodyptr)); ptr; ptr = memchr(ptr + 1, '\r', (size_t)(bend - ptr - 1)))
++	for (ptr = memchr(bodyptr, '\r', (size_t)(bend - bodyptr)); ptr; ptr = memchr(ptr + 1, '\r', (size_t)(bend - ptr - 1)))
+ 	{
+ 	  // Check for boundary string...
+ 	  if (!memcmp(ptr, bstring, blen))
+@@ -415,6 +425,8 @@
+       }
+     }
+   }
++
++  done:
+ 
+   free(body);
+ 

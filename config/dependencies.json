@@ -1,0 +1,10 @@
+{
+  "pappl": {
+    "version": "1.4.12",
+    "sha256": "1684c4e06446e9f7d93a39729fa0ba56f07a4007560080fdad7d0e2076a3615f"
+  },
+  "openssl": {
+    "version": "3.6.5",
+    "sha256": "a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98"
+  }
+}

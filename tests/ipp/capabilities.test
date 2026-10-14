@@ -1,0 +1,24 @@
+{
+  NAME "Loopback raster capabilities"
+  OPERATION Get-Printer-Attributes
+  GROUP operation-attributes-tag
+  ATTR charset attributes-charset utf-8
+  ATTR language attributes-natural-language en
+  ATTR uri printer-uri $uri
+  ATTR mimeMediaType document-format image/urf
+  STATUS successful-ok
+  EXPECT printer-uri-supported WITH-VALUE "$uri"
+  EXPECT document-format-supported WITH-VALUE image/urf
+  EXPECT document-format-supported WITH-VALUE image/pwg-raster
+  EXPECT document-format-supported COUNT 3 WITH-VALUE application/octet-stream
+  EXPECT !mopria-certified
+  EXPECT !ipp-features-supported
+  EXPECT !pages-per-minute
+  EXPECT pwg-raster-document-resolution-supported WITH-VALUE 600dpi
+  EXPECT pwg-raster-document-type-supported WITH-VALUE black_1
+  EXPECT pwg-raster-document-type-supported WITH-VALUE sgray_8
+  EXPECT sides-supported COUNT 1 WITH-VALUE one-sided
+  EXPECT color-supported WITH-VALUE false
+  EXPECT media-supported COUNT 2
+  EXPECT copies-supported WITH-VALUE 1-99
+}

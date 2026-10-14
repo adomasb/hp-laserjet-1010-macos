@@ -1,0 +1,45 @@
+{
+  NAME "Reject unsupported PDF"
+  OPERATION Validate-Job
+  GROUP operation-attributes-tag
+  ATTR charset attributes-charset utf-8
+  ATTR language attributes-natural-language en
+  ATTR uri printer-uri $uri
+  ATTR mimeMediaType document-format application/pdf
+  STATUS client-error-document-format-not-supported
+}
+{
+  NAME "Reject unsupported duplex"
+  OPERATION Validate-Job
+  GROUP operation-attributes-tag
+  ATTR charset attributes-charset utf-8
+  ATTR language attributes-natural-language en
+  ATTR uri printer-uri $uri
+  ATTR boolean ipp-attribute-fidelity true
+  GROUP job-attributes-tag
+  ATTR keyword sides two-sided-long-edge
+  STATUS client-error-attributes-or-values-not-supported
+}
+{
+  NAME "Reject unsupported 300dpi"
+  OPERATION Validate-Job
+  GROUP operation-attributes-tag
+  ATTR charset attributes-charset utf-8
+  ATTR language attributes-natural-language en
+  ATTR uri printer-uri $uri
+  ATTR boolean ipp-attribute-fidelity true
+  GROUP job-attributes-tag
+  ATTR resolution printer-resolution 300dpi
+  STATUS client-error-attributes-or-values-not-supported
+}
+{
+  NAME "Reject copy resource bound"
+  OPERATION Validate-Job
+  GROUP operation-attributes-tag
+  ATTR charset attributes-charset utf-8
+  ATTR language attributes-natural-language en
+  ATTR uri printer-uri $uri
+  GROUP job-attributes-tag
+  ATTR integer copies 100
+  STATUS client-error-attributes-or-values-not-supported
+}

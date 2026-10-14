@@ -1,0 +1,494 @@
+--- a/pappl/Makefile
++++ b/pappl/Makefile
+@@ -11,6 +11,8 @@
+ 
+ 
+ BASEOBJS =	\
++		hp-input.o \
++		hp-raster.o \
+ 		client.o \
+ 		client-accessors.o \
+ 		client-auth.o \
+--- a/pappl/client-ipp.c
++++ b/pappl/client-ipp.c
+@@ -24,7 +24,7 @@
+ 
+   if (httpGetState(client->http) == HTTP_STATE_POST_RECV)
+   {
+-    while (httpRead(client->http, buffer, sizeof(buffer)) > 0)
++    while (_papplClientReadInput(client, (unsigned char *)buffer, sizeof(buffer)) > 0)
+       ;				// Read all data
+   }
+ }
+--- a/pappl/client-private.h
++++ b/pappl/client-private.h
+@@ -22,6 +22,7 @@
+ struct _pappl_client_s			// Client data
+ {
+   pappl_system_t	*system;		// Containing system
++  size_t input_bytes, input_limit;
+   int			number;			// Connection number
+   pthread_t		thread_id;		// Thread ID
+   http_t		*http;			// HTTP connection
+@@ -50,6 +51,8 @@
+ // Functions...
+ //
+ 
++extern ssize_t _papplClientReadInput(void *context, unsigned char *buffer, size_t bytes);
++extern ssize_t _papplClientReadIPP(void *context, unsigned char *buffer, size_t bytes);
+ extern void		_papplClientCleanTempFiles(pappl_client_t *client) _PAPPL_PRIVATE;
+ extern pappl_client_t	*_papplClientCreate(pappl_system_t *system, int sock) _PAPPL_PRIVATE;
+ extern char		*_papplClientCreateTempFile(pappl_client_t *client, const void *data, size_t datasize) _PAPPL_PRIVATE;
+--- a/pappl/client.c
++++ b/pappl/client.c
+@@ -9,6 +9,7 @@
+ //
+ 
+ #include "pappl-private.h"
++#include "printer_protocol.h"
+ 
+ 
+ //
+@@ -78,6 +79,7 @@
+     return (NULL);
+   }
+ 
++  httpSetTimeout(client->http, 5.0, NULL, NULL);
+   httpGetHostname(client->http, client->hostname, sizeof(client->hostname));
+ 
+   papplLogClient(client, PAPPL_LOGLEVEL_INFO, "Accepted connection from '%s'.", client->hostname);
+@@ -201,6 +203,7 @@
+   ippDelete(client->request);
+   ippDelete(client->response);
+ 
++  client->username[0] = '\0'; // Authentication is per request, never per connection.
+   client->loc       = NULL;
+   client->request   = NULL;
+   client->response  = NULL;
+@@ -263,39 +266,32 @@
+ 
+   papplLogClient(client, PAPPL_LOGLEVEL_INFO, "%s %s://%s%s HTTP/%d.%d (%s)", httpStateString(http_state), httpIsEncrypted(client->http) ? "https" : "http", httpGetField(client->http, HTTP_FIELD_HOST), uri, http_version / 100, http_version % 100, client->language);
+ 
+-  // Validate the host header...
+-  if (!httpGetField(client->http, HTTP_FIELD_HOST)[0] &&
+-      httpGetVersion(client->http) >= HTTP_VERSION_1_1)
+-  {
+-    // HTTP/1.1 and higher require the "Host:" field...
++  // This build serves only the explicit IPv4 loopback endpoint. No numeric
++  // prefix, .local suffix, arbitrary IP literal, or alternate port is trusted.
++  const char *host = httpGetField(client->http, HTTP_FIELD_HOST);
++  int expected_port = papplSystemGetHostPort(client->system);
++  snprintf(system_host, sizeof(system_host), "127.0.0.1:%d", expected_port);
++  bool valid_host = !strcmp(host, system_host);
++  snprintf(system_host, sizeof(system_host), "localhost:%d", expected_port);
++  valid_host = valid_host || !strcasecmp(host, system_host);
++  if (!valid_host || uri[0] != '/')
++  {
+     papplClientRespond(client, HTTP_STATUS_BAD_REQUEST, NULL, NULL, 0, 0);
+     return (false);
+   }
+-
+-  papplCopyString(client->host_field, httpGetField(client->http, HTTP_FIELD_HOST), sizeof(client->host_field));
+-  if ((ptr = strrchr(client->host_field, ':')) != NULL)
+-  {
+-    char *end;				// End of port number
+-
+-    // Grab port number from Host: header...
+-    *ptr++ = '\0';
+-    client->host_port = (int)strtol(ptr, &end, 10);
+-
+-    if (errno == ERANGE || *end)
+-      client->host_port = papplSystemGetHostPort(client->system);
+-  }
+-  else
+-  {
+-    // Use the default port number...
+-    client->host_port = papplSystemGetHostPort(client->system);
+-  }
+-
+-  ptr = strstr(client->host_field, ".local");
+-
+-  if (!isdigit(client->host_field[0] & 255) && client->host_field[0] != '[' && strcmp(client->host_field, papplSystemGetHostName(client->system, system_host, sizeof(system_host))) && strcmp(client->host_field, "localhost") && (!ptr || (strcmp(ptr, ".local") && strcmp(ptr, ".local."))))
+-  {
+-    papplLogClient(client, PAPPL_LOGLEVEL_ERROR, "Bad Host: header '%s'.", client->host_field);
+-    papplClientRespond(client, HTTP_STATUS_BAD_REQUEST, NULL, NULL, 0, 0);
++  papplCopyString(client->host_field, host, sizeof(client->host_field));
++  ptr = strchr(client->host_field, ':');
++  *ptr = '\0';
++  client->host_port = expected_port;
++
++  // The helper exposes only IPP. Browsers cannot submit simple form requests
++  // or use a CORS preflight to gain access; no web administration is needed.
++  if (client->system->auth_cb &&
++      (client->operation != HTTP_STATE_POST || strncmp(uri, "/ipp/print", 10) ||
++       (uri[10] && uri[10] != '/') || client->options ||
++       strcmp(httpGetField(client->http, HTTP_FIELD_CONTENT_TYPE), "application/ipp")))
++  {
++    papplClientRespond(client, HTTP_STATUS_FORBIDDEN, NULL, NULL, 0, 0);
+     return (false);
+   }
+ 
+@@ -425,9 +421,11 @@
+         if (!strcmp(httpGetField(client->http, HTTP_FIELD_CONTENT_TYPE), "application/ipp"))
+         {
+ 	  // Read the IPP request...
+-	  client->request = ippNew();
+-
+-	  while ((ipp_state = ippRead(client->http, client->request)) != IPP_STATE_DATA)
++	  client->input_bytes = 0;
++          client->input_limit = HP_IPP_ATTRIBUTE_LIMIT;
++          client->request = ippNew();
++
++	  while ((ipp_state = ippReadIO(client, _papplClientReadIPP, 1, NULL, client->request)) != IPP_STATE_DATA)
+ 	  {
+ 	    if (ipp_state == IPP_STATE_ERROR)
+ 	    {
+@@ -437,7 +435,20 @@
+ 	    }
+ 	  }
+ 
+-	  // Now that we have the IPP request, process the request...
++          // Capability discovery is needed by macOS when creating its queue.
++          // Every other operation, including job queries and system operations,
++          // authenticates before PAPPL dispatch can inspect or mutate anything.
++          if (client->system->auth_cb && ippGetOperation(client->request) != IPP_OP_GET_PRINTER_ATTRIBUTES)
++          {
++            http_status_t access = papplClientIsAuthorized(client);
++            if (access != HTTP_STATUS_CONTINUE)
++            {
++              papplClientRespond(client, access, NULL, NULL, 0, 0);
++              return (false);
++            }
++          }
++	  client->input_limit = HP_DOCUMENT_LIMIT;
++          // Now that we have the IPP request, process the request...
+ 	  return (_papplClientProcessIPP(client));
+ 	}
+ 	else if ((resource = _papplSystemFindResourceForPath(client->system, client->uri)) != NULL)
+--- a/pappl/job-ipp.c
++++ b/pappl/job-ipp.c
+@@ -146,7 +146,7 @@
+ 
+   papplLogJob(job, PAPPL_LOGLEVEL_DEBUG, "Created job file \"%s\", format \"%s\".", filename, job->format);
+ 
+-  while ((bytes = httpRead(client->http, buffer, sizeof(buffer))) > 0)
++  while ((bytes = _papplClientReadInput(client, (unsigned char *)buffer, sizeof(buffer))) > 0)
+   {
+     if (write(job->fd, buffer, (size_t)bytes) < bytes)
+     {
+@@ -537,9 +537,10 @@
+ 
+   _papplRWLockRead(client->printer);
+ 
+-  if (op != IPP_OP_CREATE_JOB && (supported = ippFindAttribute(client->printer->attrs, "document-format-supported", IPP_TAG_MIMETYPE)) != NULL && !ippContainsString(supported, format))
++  if (op != IPP_OP_CREATE_JOB && (supported = ippFindAttribute(client->printer->driver_attrs, "document-format-supported", IPP_TAG_MIMETYPE)) != NULL && (!format || !ippContainsString(supported, format)))
+   {
+     papplClientRespondIPPUnsupported(client, attr);
++    ippSetStatusCode(client->response, IPP_STATUS_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED);
+     valid = false;
+   }
+ 
+--- a/pappl/job-process.c
++++ b/pappl/job-process.c
+@@ -8,6 +8,9 @@
+ //
+ 
+ #include "pappl-private.h"
++#include "hp-raster.h"
++#include "printer_protocol.h"
++
+ 
+ 
+ //
+@@ -571,6 +574,8 @@
+   pappl_printer_t	*printer = job->printer;
+ 					// Printer for job
+   pappl_pr_options_t	*options = NULL;// Job options
++  hp_raster_guard input;
++  memset(&input, 0, sizeof(input));
+   cups_raster_t		*ras = NULL;	// Raster stream
+   cups_page_header_t	header;		// Page header
+   unsigned		header_pages;	// Number of pages from page header
+@@ -596,7 +601,7 @@
+     goto complete_job;
+ 
+   // Open the raster stream...
+-  if ((ras = cupsRasterOpenIO((cups_raster_cb_t)httpRead, client->http, CUPS_RASTER_READ)) == NULL)
++  if (!hp_raster_prepare(&input, client) || (ras = cupsRasterOpenIO(hp_raster_read, &input, CUPS_RASTER_READ)) == NULL)
+   {
+     papplLogJob(job, PAPPL_LOGLEVEL_ERROR, "Unable to open raster stream from client - %s", cupsGetErrorString());
+     job->state = IPP_JSTATE_ABORTED;
+@@ -604,7 +609,7 @@
+   }
+ 
+   // Prepare options...
+-  if (!cupsRasterReadHeader(ras, &header))
++  if (!hp_raster_header(ras, &header, &input))
+   {
+     papplLogJob(job, PAPPL_LOGLEVEL_ERROR, "Unable to read raster stream from client - %s", cupsGetErrorString());
+     job->state = IPP_JSTATE_ABORTED;
+@@ -652,7 +657,7 @@
+     papplJobDeletePrintOptions(options);
+     options = papplJobCreatePrintOptions(job, (unsigned)job->impressions, header.cupsBitsPerPixel > 8);
+ 
+-    if (header.cupsWidth == 0 || header.cupsHeight == 0 || (header.cupsBitsPerColor != 1 && header.cupsBitsPerColor != 8) || header.cupsColorOrder != CUPS_ORDER_CHUNKED || (header.cupsBytesPerLine != ((header.cupsWidth * header.cupsBitsPerPixel + 7) / 8)))
++    if (page >= HP_MAX_PAGES || header.cupsWidth == 0 || header.cupsWidth > HP_MAX_DIMENSION || header.cupsHeight == 0 || header.cupsHeight > HP_MAX_DIMENSION || header.cupsInteger[CUPS_RASTER_PWG_TotalPageCount] > HP_MAX_PAGES || header.HWResolution[0] != HP_RESOLUTION || header.HWResolution[1] != HP_RESOLUTION || header.Duplex || (header.cupsBitsPerPixel != 1 && header.cupsBitsPerPixel != 8) || (header.cupsColorSpace != CUPS_CSPACE_K && header.cupsColorSpace != CUPS_CSPACE_SW && header.cupsColorSpace != CUPS_CSPACE_W) || (header.cupsBitsPerColor != 1 && header.cupsBitsPerColor != 8) || header.cupsColorOrder != CUPS_ORDER_CHUNKED || (header.cupsBytesPerLine != ((header.cupsWidth * header.cupsBitsPerPixel + 7) / 8)))
+     {
+       papplLogJob(job, PAPPL_LOGLEVEL_ERROR, "Bad raster data seen.");
+       papplJobSetReasons(job, PAPPL_JREASON_DOCUMENT_FORMAT_ERROR, PAPPL_JREASON_NONE);
+@@ -668,8 +673,10 @@
+       break;
+     }
+ 
+-    if (options->header.cupsBitsPerPixel >= 8 && header.cupsBitsPerPixel >= 8)
+-      options->header = header;		// Use page header from client
++    options->header.cupsWidth = header.cupsWidth;
++    options->header.cupsHeight = header.cupsHeight;
++    options->header.cupsBytesPerLine = (header.cupsWidth + 7) / 8;
++    options->header.HWResolution[0] = options->header.HWResolution[1] = HP_RESOLUTION;
+ 
+     if (!(printer->driver_data.rstartpage_cb)(job, options, job->printer->device, page))
+     {
+@@ -714,7 +721,7 @@
+ 
+     for (y = 0; !job->is_canceled && y < header.cupsHeight && y < options->header.cupsHeight; y ++)
+     {
+-      if (cupsRasterReadPixels(ras, pixels, header.cupsBytesPerLine))
++      if (cupsRasterReadPixels(ras, pixels, header.cupsBytesPerLine) == header.cupsBytesPerLine)
+       {
+         if (header.cupsBitsPerPixel == 8 && options->header.cupsBitsPerPixel == 1)
+         {
+@@ -765,54 +772,26 @@
+ 	      *lineptr = byte;
+ 	  }
+ 
+-          (printer->driver_data.rwriteline_cb)(job, options, job->printer->device, y, line);
++          if (!(printer->driver_data.rwriteline_cb)(job, options, job->printer->device, y, line)) { job->state = IPP_JSTATE_ABORTED; break; }
+         }
+         else
+-          (printer->driver_data.rwriteline_cb)(job, options, job->printer->device, y, pixels);
++        {
++          if (header.cupsBitsPerPixel == 1 && header.cupsColorSpace != CUPS_CSPACE_K)
++            for (x = 0; x < header.cupsBytesPerLine; x ++) pixels[x] ^= 255;
++          if (!(printer->driver_data.rwriteline_cb)(job, options, job->printer->device, y, pixels)) { job->state = IPP_JSTATE_ABORTED; break; }
++        }
+       }
+       else
+         break;
+     }
+ 
+     if (!job->is_canceled && y < header.cupsHeight)
+-    {
+-      // Discard excess lines from client...
+-      while (y < header.cupsHeight)
+-      {
+-        cupsRasterReadPixels(ras, pixels, header.cupsBytesPerLine);
+-        y ++;
+-      }
+-    }
+-    else
+-    {
+-      // Pad missing lines with whitespace...
+-      if (header.cupsBitsPerPixel == 8 && options->header.cupsBitsPerPixel == 1)
+-      {
+-        memset(line, 0, options->header.cupsBytesPerLine);
+-
+-        while (y < options->header.cupsHeight)
+-        {
+-	  (printer->driver_data.rwriteline_cb)(job, options, job->printer->device, y, line);
+-          y ++;
+-        }
+-      }
+-      else
+-      {
+-        if (header.cupsColorSpace == CUPS_CSPACE_K || header.cupsColorSpace == CUPS_CSPACE_CMYK)
+-          memset(pixels, 0x00, header.cupsBytesPerLine);
+-	else
+-          memset(pixels, 0xff, header.cupsBytesPerLine);
+-
+-        while (y < options->header.cupsHeight)
+-        {
+-	  (printer->driver_data.rwriteline_cb)(job, options, job->printer->device, y, pixels);
+-          y ++;
+-        }
+-      }
+-    }
++      job->state = IPP_JSTATE_ABORTED;
+ 
+     free(pixels);
+     free(line);
++
++    if (job->state == IPP_JSTATE_ABORTED || job->is_canceled) break;
+ 
+     if (!(printer->driver_data.rendpage_cb)(job, options, job->printer->device, page))
+     {
+@@ -840,13 +819,17 @@
+       break;
+     }
+   }
+-  while (cupsRasterReadHeader(ras, &header));
++  while (hp_raster_header(ras, &header, &input));
+ 
+   if (next_copy == 0)
+   {
+     // Not tracking copies so record this as a single completed copy...
+     papplJobSetCopiesCompleted(job, 1);
+   }
++
++  if (input.failed && !job->is_canceled) job->state = IPP_JSTATE_ABORTED;
++
++  if (header_pages && page != header_pages && !job->is_canceled) job->state = IPP_JSTATE_ABORTED;
+ 
+   if (!(printer->driver_data.rendjob_cb)(job, options, job->printer->device))
+     job->state = IPP_JSTATE_ABORTED;
+@@ -862,7 +845,7 @@
+     // Flush excess data...
+     char	buffer[8192];		// Read buffer
+ 
+-    while (httpRead(client->http, buffer, sizeof(buffer)) > 0)
++    while (_papplClientReadInput(client, (unsigned char *)buffer, sizeof(buffer)) > 0)
+       ;				// Read all document data
+   }
+ 
+--- a/pappl/printer-driver.c
++++ b/pappl/printer-driver.c
+@@ -610,9 +610,7 @@
+   if (num_values > 0)
+     memcpy((void *)svalues, data->features, (size_t)num_values * sizeof(char *));
+ 
+-  svalues[num_values ++] = "ipp-everywhere";
+-
+-  ippAddStrings(attrs, IPP_TAG_PRINTER, IPP_CONST_TAG(IPP_TAG_KEYWORD), "ipp-features-supported", num_values, NULL, svalues);
++  if (num_values > 0) ippAddStrings(attrs, IPP_TAG_PRINTER, IPP_CONST_TAG(IPP_TAG_KEYWORD), "ipp-features-supported", num_values, NULL, svalues);
+ 
+ 
+   // job-creation-attributes-supported
+@@ -945,8 +943,7 @@
+ 
+ 
+   // mopria-certified (Mopria-specific attribute)
+-  if (!ippFindAttribute(attrs, "mopria-certified", IPP_TAG_ZERO))
+-    ippAddString(attrs, IPP_TAG_PRINTER, IPP_CONST_TAG(IPP_TAG_TEXT), "mopria-certified", NULL, "1.3");
++
+ 
+ 
+   // output-bin-supported
+@@ -966,8 +963,7 @@
+   // pages-per-minute
+   if (data->ppm > 0)
+     ippAddInteger(attrs, IPP_TAG_PRINTER, IPP_TAG_INTEGER, "pages-per-minute", data->ppm);
+-  else
+-    ippAddInteger(attrs, IPP_TAG_PRINTER, IPP_TAG_INTEGER, "pages-per-minute", 1);
++
+ 
+ 
+   // pages-per-minute-color
+@@ -1633,7 +1629,7 @@
+     ret = false;
+   }
+ 
+-  if (data->ppm <= 0)
++  if (data->ppm < 0)
+   {
+     papplLogPrinter(printer, PAPPL_LOGLEVEL_ERROR, "Driver does not provide a valid ppm value (%d).", data->ppm);
+     ret = false;
+--- a/pappl/printer-ipp.c
++++ b/pappl/printer-ipp.c
+@@ -9,6 +9,7 @@
+ //
+ 
+ #include "pappl-private.h"
++#include "printer_protocol.h"
+ 
+ 
+ //
+@@ -79,9 +80,9 @@
+     // Filter copies-supported value based on the document format...
+     // (no copy support for streaming raster formats)
+     if (format && (!strcmp(format, "image/pwg-raster") || !strcmp(format, "image/urf")))
+-      ippAddRange(client->response, IPP_TAG_PRINTER, "copies-supported", 1, 1);
++      ippAddRange(client->response, IPP_TAG_PRINTER, "copies-supported", 1, HP_MAX_COPIES);
+     else
+-      ippAddRange(client->response, IPP_TAG_PRINTER, "copies-supported", 1, 999);
++      ippAddRange(client->response, IPP_TAG_PRINTER, "copies-supported", 1, HP_MAX_COPIES);
+   }
+ 
+   if (!ra || cupsArrayFind(ra, "identify-actions-default"))
+@@ -594,7 +595,9 @@
+     // supported.  Since we only support authentication over a secure (TLS)
+     // channel, the value is always 'none' for the "ipp" URI and either 'none'
+     // or 'basic' for the "ipps" URI...
+-    if (httpAddrIsLocalhost(httpGetAddress(client->http)) || (client->system->options & PAPPL_SOPTIONS_NO_TLS))
++    if (client->system->auth_cb)
++      ippAddString(client->response, IPP_TAG_PRINTER, IPP_CONST_TAG(IPP_TAG_KEYWORD), "uri-authentication-supported", NULL, "basic");
++    else if (httpAddrIsLocalhost(httpGetAddress(client->http)) || (client->system->options & PAPPL_SOPTIONS_NO_TLS))
+     {
+       ippAddString(client->response, IPP_TAG_PRINTER, IPP_CONST_TAG(IPP_TAG_KEYWORD), "uri-authentication-supported", NULL, "none");
+     }
+@@ -2082,7 +2085,7 @@
+ 
+   if ((attr = ippFindAttribute(client->request, "copies", IPP_TAG_ZERO)) != NULL)
+   {
+-    if (ippGetCount(attr) != 1 || ippGetValueTag(attr) != IPP_TAG_INTEGER || ippGetInteger(attr, 0) < 1 || ippGetInteger(attr, 0) > 999)
++    if (ippGetCount(attr) != 1 || ippGetValueTag(attr) != IPP_TAG_INTEGER || ippGetInteger(attr, 0) < 1 || ippGetInteger(attr, 0) > HP_MAX_COPIES)
+     {
+       papplClientRespondIPPUnsupported(client, attr);
+       valid = false;
+--- a/pappl/printer.c
++++ b/pappl/printer.c
+@@ -9,6 +9,7 @@
+ //
+ 
+ #include "pappl-private.h"
++#include "printer_protocol.h"
+ 
+ 
+ //
+@@ -462,7 +463,7 @@
+   ippAddBoolean(printer->attrs, IPP_TAG_PRINTER, "job-ids-supported", 1);
+ 
+   // job-k-octets-supported
+-  ippAddRange(printer->attrs, IPP_TAG_PRINTER, "job-k-octets-supported", 0, k_supported);
++  ippAddRange(printer->attrs, IPP_TAG_PRINTER, "job-k-octets-supported", 0, (int)(HP_DOCUMENT_LIMIT / 1024));
+ 
+   // job-priority-default
+   ippAddInteger(printer->attrs, IPP_TAG_PRINTER, IPP_TAG_INTEGER, "job-priority-default", 50);
+--- a/pappl/system-accessors.c
++++ b/pappl/system-accessors.c
+@@ -76,6 +76,9 @@
+   if (name && isdigit(*name & 255))
+   {
+     // Add IPv4 listener...
++    free(system->hostname);
++    system->hostname = strdup(name);
++    system->is_listenhost = true;
+     if (system->port)
+     {
+       ret = add_listeners(system, name, system->port, AF_INET);
+--- a/pappl/system.c
++++ b/pappl/system.c
+@@ -17,7 +17,7 @@
+ // Local globals...
+ //
+ 
+-static time_t	sigterm_time = 0;	// SIGTERM time?
++static volatile sig_atomic_t sigterm_time = 0;	// SIGTERM time?
+ static bool	restart_logging = false;// Restart logging?
+ 
+ 
+@@ -759,7 +759,7 @@
+         break;				// Shutdown-System request
+       }
+ 
+-      if (sigterm_time && (time(NULL) - sigterm_time) > 60)
++      if (false)
+       {
+         _papplRWUnlock(system);
+         break;				// SIGTERM received
+@@ -1051,5 +1051,5 @@
+ {
+   (void)sig;
+ 
+-  sigterm_time = time(NULL);
++  sigterm_time = 1;
+ }

@@ -1,0 +1,25 @@
+# ipptool -f malformed-or-valid-raster URI tests/ipp/abort.test
+# Used with malformed raster or helper transport fault flags.
+{
+  NAME "Submit fault test raster"
+  OPERATION Print-Job
+  GROUP operation-attributes-tag
+  ATTR charset attributes-charset utf-8
+  ATTR language attributes-natural-language en
+  ATTR uri printer-uri $uri
+  ATTR mimeMediaType document-format image/pwg-raster
+  FILE $filename
+  STATUS successful-ok
+  EXPECT job-id DEFINE-VALUE job_id
+}
+{
+  NAME "Failed raster job is aborted"
+  OPERATION Get-Job-Attributes
+  GROUP operation-attributes-tag
+  ATTR charset attributes-charset utf-8
+  ATTR language attributes-natural-language en
+  ATTR uri printer-uri $uri
+  ATTR integer job-id $job_id
+  STATUS successful-ok
+  EXPECT job-state WITH-VALUE 8 REPEAT-NO-MATCH REPEAT-LIMIT 10
+}
